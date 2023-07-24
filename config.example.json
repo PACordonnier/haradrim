@@ -36,8 +36,32 @@
             "https://github.com/TOSIT-IO/hbase-operator-tools/releases/download/1.1.0-0.0/hbase-hbck2-1.1.0-0.0.jar"
         ]
     },
-    "collection_core": {
-        "namespace": "tosit.tdp"
+    "collections": [
+        {
+            "name": "https://github.com/TOSIT-IO/tdp-collection",
+            "namespace": "tosit.tdp",
+            "tag": "0.1"
+        },
+        {
+            "name": "https://github.com/TOSIT-IO/tdp-collection-extras",
+            "namespace": "tosit.tdp_extra",
+            "tag": "master"
+        }
+    ],
+    "manager": {
+        "lib": {
+            "url": "https://github.com/TOSIT-IO/tdp-lib",
+            "tag": "0.1"
+        },
+        "server": {
+            "port": 8000,
+            "url": "https://github.com/TOSIT-IO/tdp-server",
+            "tag": "0.1"
+        },
+        "ui": {
+            "port": 3000,
+            "url": "https://github.com/TOSIT-IO/tdp-ui",
+            "tag": "0.1"
+        }
     }
-    
 }

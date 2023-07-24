@@ -1,0 +1,393 @@
+#!/bin/bash
+
+# defaults
+TDP_ROOT_PATH=.
+CONFIG_FILE="config.json"
+INVENTORY_PATH=inventory/hosts.ini,inventory/topologies
+CLEAN="false"
+HELP="false"
+
+# Manager repositories
+readonly TDP_UI_URI=https://github.com/TOSIT-IO/tdp-ui
+readonly TDP_SERVER_URI=https://github.com/TOSIT-IO/tdp-server
+readonly TDP_LIB_URI=https://github.com/TOSIT-IO/tdp-lib
+
+# Required binaries
+readonly PYTHON_BIN=${PYTHON_BIN:-python3}
+readonly NPM_BIN=${NPM_BIN:-npm}
+
+STEP_COUNTER=0 # step counter
+
+# Utils
+
+print_help() {
+  cat <<EOF
+
+SYNOPSIS
+  Script to install everything necessary to install TDP on your cluster of machines.
+
+USAGE
+  setup.sh [-hc] [-f configuration_file] [-i inventories] [-p directory_name] [-v tdp_override_vars]
+
+OPTIONS
+  -c Run in clean mode (reset everything apart from TDP binaries files)
+  -f Configuration file (default config.json)
+  -h Display help
+  -i Comma separated list of Ansible inventory sources (relative to TDP installation directory)
+  -p Create or use the directory for TDP installation (default ".")
+  -v Directory with TDP override variables (relative to TDP installation directory)
+EOF
+}
+
+parse_cmdline() {
+  local OPTIND
+  while getopts 'chf:i:p:v:' options; do
+    case "$options" in
+    c) CLEAN="true" ;;
+    f) CONFIG_FILE="$OPTARG" ;;
+    h) HELP="true" && return 0 ;;
+    i) INVENTORY_PATH="$OPTARG" ;;
+    p) TDP_ROOT_PATH="$OPTARG" ;;
+    v) TDP_VARS_OVERRIDES="$OPTARG" ;;
+    *) return 1 ;;
+    esac
+  done
+  shift $((OPTIND - 1))
+  return 0
+}
+
+join_arr() {
+  local IFS="$1"
+  shift
+  echo "$*"
+}
+
+clean_mode_check() {
+  if [[ "$CLEAN" == "true" ]]; then
+    echo "Remove ${1}"
+    rm -rf "$1"
+  fi
+  if [[ -e "${1}" ]]; then
+    echo "${1} exists, nothing to do"
+    return 1
+  fi
+  return 0
+}
+
+run_step() {
+  local function=$1
+  local title=$2
+
+  STEP_COUNTER=$((STEP_COUNTER + 1))
+  echo -e '\n## Step '$STEP_COUNTER'.' $title'\n'
+  # Call the provided function
+  "$function"
+  return 0
+}
+
+# Steps
+
+init_setup_vars() {
+
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    echo "$CONFIG_FILE doesn't exists, terminating."
+    exit 1
+  fi
+  mkdir -p "$TDP_ROOT_PATH"
+  TDP_ROOT_PATH=$(realpath "$TDP_ROOT_PATH")
+
+  ANSIBLE_CONFIG_PATH=$TDP_ROOT_PATH/ansible.cfg
+  BINARIES_PATH=$TDP_ROOT_PATH/files
+  ENV_PATH=$TDP_ROOT_PATH/.env
+  PYTHON_VENV_PATH=$TDP_ROOT_PATH/venv
+  SQLITE_DB_PATH=$TDP_ROOT_PATH/sqlite.db
+  TDP_DATABASE_DSN=sqlite:///$SQLITE_DB_PATH
+  TDP_COLLECTIONS_ROOT_PATH=$TDP_ROOT_PATH/ansible_collections
+  TDP_LIB_PATH=$TDP_ROOT_PATH/tdp-lib
+  TDP_SERVER_PATH=$TDP_ROOT_PATH/tdp-server
+  TDP_UI_PATH=$TDP_ROOT_PATH/tdp-ui
+  TDP_VARS_PATH=$TDP_ROOT_PATH/tdp_vars
+
+  echo "TDP prerequisites will be installed to $TDP_ROOT_PATH"
+  cat <<EOF
+Provided arguments:
+  CONFIG_FILE = $CONFIG_FILE
+  INVENTORY_PATH = $INVENTORY_PATH
+  TDP_ROOT_PATH = $TDP_ROOT_PATH
+  TDP_VARS_OVERRIDES = $TDP_VARS_OVERRIDES
+
+Variables:
+  ANSIBLE_CONFIG_PATH = $ANSIBLE_CONFIG_PATH
+  BINARIES_PATH = $BINARIES_PATH
+  ENV_PATH = $ENV_PATH
+  PYTHON_VENV_PATH = $PYTHON_VENV_PATH
+  SQLITE_DB_PATH = $SQLITE_DB_PATH
+  TDP_DATABASE_DSN = $TDP_DATABASE_DSN
+  TDP_COLLECTIONS_ROOT_PATH = $TDP_COLLECTIONS_ROOT_PATH
+  TDP_LIB_PATH = $TDP_LIB_PATH
+  TDP_SERVER_PATH = $TDP_SERVER_PATH
+  TDP_UI_PATH = $TDP_UI_PATH
+  TDP_VARS_PATH = $TDP_VARS_PATH
+
+EOF
+  return 0
+}
+
+setup_binaries() {
+  download_file() {
+    local url=$1
+    local filename="${url##*/}"
+    local path="$BINARIES_PATH/$filename"
+
+    # Download the file if it doesn't already exist in the cache
+    if [ ! -f "$path" ]; then
+      echo "Downloading: $filename"
+      curl -L -o "$path" "$url"
+    else
+      echo "File already exists: $filename"
+    fi
+  }
+
+  mkdir -p "$BINARIES_PATH"
+  for release_uri in $(jq -r '.stack.releases_uris[]' $CONFIG_FILE); do
+    download_file "$release_uri"
+  done
+  return 0
+}
+
+setup_env_vars() {
+  # get collection paths
+  local collection_path=()
+  for namespace in $(jq -r '.collections[].namespace' $CONFIG_FILE); do
+    collection_path+=("$TDP_COLLECTIONS_ROOT_PATH/${namespace//.//}")
+  done
+  collection_path=$(join_arr : "${collection_path[@]}")
+
+  clean_mode_check $ENV_PATH
+  if [[ $? == 1 ]]; then
+    return 0
+  fi
+
+  local server_port=$(jq -r ".manager.server.port" $CONFIG_FILE)
+  local ui_port=$(jq -r ".manager.ui.port" $CONFIG_FILE)
+
+  echo 'Create' $ENV_PATH
+  cat <<EOF >"$ENV_PATH"
+# common
+export TDP_COLLECTION_PATH=$collection_path
+export TDP_RUN_DIRECTORY="$TDP_ROOT_PATH"
+export TDP_VARS="$TDP_VARS_PATH"
+
+# tdp-lib
+export TDP_DATABASE_DSN=$TDP_DATABASE_DSN
+
+# tdp-server
+export PROJECT_NAME=tdp-server
+export BACKEND_CORS_ORIGINS="[\"http://localhost:$ui_port\"]"
+export SERVER_NAME=localhost
+export SERVER_HOST=http://localhost:$server_port
+export OPENID_CONNECT_DISCOVERY_URL=http://localhost:8080/auth/realms/tdp_server/.well-known/openid-configuration
+export OPENID_CLIENT_ID=tdp_server
+export DATABASE_DSN=$TDP_DATABASE_DSN
+export UVICORN_PORT=$server_port
+export DO_NOT_USE_IN_PRODUCTION_DISABLE_TOKEN_CHECK=True
+EOF
+  return 0
+}
+
+setup_python_venv() {
+  clean_mode_check "$PYTHON_VENV_PATH"
+  if [[ $? == 1 ]]; then
+    return 0
+  fi
+
+  if [[ ! -d "$PYTHON_VENV_PATH" ]]; then
+    echo "Create python venv with '${PYTHON_BIN}' to '${PYTHON_VENV_PATH}' and update pip to latest version"
+    "$PYTHON_BIN" -m venv "$PYTHON_VENV_PATH"
+    (
+      source "${PYTHON_VENV_PATH}/bin/activate"
+      pip install -U pip
+    )
+  else
+    echo "Python venv '${PYTHON_VENV_PATH}' already exists, nothing to do"
+  fi
+  echo "Install python dependencies"
+  (
+    source "${PYTHON_VENV_PATH}/bin/activate"
+    pip install ansible==8.1
+    pip install jmespath==0.10.0
+    pip install "mitogen<0.3,>0.2.9"
+    pip install passlib==1.7.4
+    pip install "$TDP_ROOT_PATH/tdp-server" uvicorn==0.16.0
+    pip install "$TDP_ROOT_PATH/tdp-lib[visualization]"
+  )
+  return 0
+}
+
+setup_collections() {
+  clean_mode_check "$TDP_COLLECTIONS_ROOT_PATH"
+  if [[ $? == 1 ]]; then
+    return 0
+  fi
+
+  source "${PYTHON_VENV_PATH}/bin/activate"
+  for k in $(jq -r '.collections | keys | .[]' $CONFIG_FILE); do
+    collection=$(jq -r ".collections[$k]" $CONFIG_FILE)
+    name=$(jq -r '.name' <<<$collection)
+    tag=$(jq -r '.tag' <<<$collection)
+    echo "Installing " "git+$name,$tag"
+    ansible-galaxy collection install git+$name,$tag -p "$TDP_ROOT_PATH"
+  done
+  return 0
+}
+
+setup_symlinks() {
+  create_symlink_if_needed() {
+    local target=$1
+    local link_name=$2
+
+    if [[ "$CLEAN" == "true" ]]; then
+      echo "Remove '${link_name}'"
+      rm -rf "$link_name"
+    fi
+    if [[ -e "$link_name" ]] || [[ -L "$link_name" ]]; then
+      echo "File '${link_name}' exists, nothing to do"
+      return 0
+    fi
+
+    echo "Create symlink '${link_name}'"
+    ln -s "$target" "$link_name"
+  }
+
+  for namespace in $(jq -r '.collections[].namespace' $CONFIG_FILE); do
+    create_symlink_if_needed "$BINARIES_PATH" "$TDP_COLLECTIONS_ROOT_PATH/${namespace//.//}/playbooks/files"
+  done
+  return 0
+}
+
+setup_manager() {
+  clone_git_repo() {
+    local url=$(jq -r ".manager.$1.url" $CONFIG_FILE)
+    local tag=$(jq -r ".manager.$1.tag" $CONFIG_FILE)
+    local path=$2
+
+    clean_mode_check $path
+    if [[ $? == 1 ]]; then
+      return 0
+    fi
+    echo "Clonning" $url "tag" $tag
+    git clone --quiet --depth 1 --branch $tag $url $path
+  }
+
+  clone_git_repo lib "$TDP_LIB_PATH"
+  clone_git_repo server "$TDP_SERVER_PATH"
+  clone_git_repo ui "$TDP_UI_PATH"
+  return 0
+}
+
+init_ansible() {
+  echo "Create" $ANSIBLE_CONFIG_PATH
+  cat <<EOF >"$ANSIBLE_CONFIG_PATH"
+[defaults]
+host_key_checking = False
+collections_paths=.
+inventory = $INVENTORY_PATH
+private_key_file = files/tdp-rsa
+log_path = logs/tdp.log
+hash_behaviour = merge
+stdout_callback = yaml
+
+[privilege_escalation]
+become=True
+become_user=root
+
+[inventory]
+cache = true
+cache_plugin = jsonfile
+cache_timeout = 7200
+cache_connection = .cache
+
+[tdp]
+vars = tdp_vars
+EOF
+  return 0
+}
+
+init_tdp_lib() {
+  clean_mode_check "$TDP_VARS_PATH"
+  clean_mode_check "$SQLITE_DB_PATH"
+  local args=(init)
+  if [[ "$CLEAN" == "true" ]]; then
+    echo "Remove '${TDP_VARS_PATH}' and '${SQLITE_DB_PATH}'"
+    rm -rf "$TDP_VARS_PATH" "$SQLITE_DB_PATH"
+  fi
+  if [[ -n "$TDP_VARS_OVERRIDES" ]]; then
+    args+=(--overrides "$TDP_VARS_OVERRIDES")
+  fi
+  (
+    source "$PYTHON_VENV_PATH/bin/activate"
+    source "$TDP_ROOT_PATH/.env"
+    tdp "${args[@]}"
+  )
+  return 0
+}
+
+init_tdp_server() {
+  (
+    source "$PYTHON_VENV_PATH/bin/activate"
+    source "$TDP_ROOT_PATH/.env"
+    python "$TDP_SERVER_PATH/tdp_server/initialize_database.py"
+    python "$TDP_SERVER_PATH/tdp_server/initialize_tdp_vars.py"
+  )
+  return 0
+}
+
+init_tdp_ui() {
+  # Create config
+  local config_path="$TDP_UI_PATH/config.json"
+  clean_mode_check $config_path
+  if [[ $? == 1 ]]; then
+    return 0
+  fi
+  local server_port=$(jq -r ".manager.server.port" $CONFIG_FILE)
+  echo "Create" $config_path
+  cat <<EOF >"$config_path"
+{
+  "apiBasePath": "http://localhost:$server_port",
+  "skipAuth": true
+}
+EOF
+
+  # Install dependencies
+  "${NPM_BIN}" --prefix "$TDP_UI_PATH" install
+  return 0
+}
+
+# Main
+
+main() {
+  parse_cmdline "$@" || {
+    print_help
+    exit 1
+  }
+  [[ "$HELP" == "true" ]] && {
+    print_help
+    exit 0
+  }
+
+  run_step init_setup_vars "Initializing setup variables"
+  run_step setup_binaries "Download binaries files"
+  run_step setup_manager "Clone TDP manager repositories"
+  run_step setup_env_vars "Initializing environment variables"
+  run_step setup_python_venv "Install Python virtual environment"
+  run_step setup_collections "Installing collections"
+  run_step setup_symlinks "Create symlinks"
+  run_step init_ansible "Initializing Ansible configuration"
+  run_step init_tdp_lib "Initializing tdp-lib"
+  run_step init_tdp_server "Initializing tdp-server"
+  run_step init_tdp_ui "Initializing tdp-ui"
+
+  echo -e "\n## Setup complete!"
+}
+
+main "$@"
