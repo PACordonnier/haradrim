@@ -7,9 +7,9 @@ Haradrim installs everything necessary to install TDP on your cluster of machine
 
 Install required packages:
 
-- Python >= 3.9 with virtual env package (i.e. `python3-venv`)
-- Node.js >= 14.13.0
-- `jq` required to execute helper script
+- `python` >= 3.9 with virtual env package (i.e. `python3-venv`)
+- `npm` >= 14.13.0
+- `jq`
 - `git`
 - `curl`
 
