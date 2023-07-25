@@ -7,11 +7,6 @@ INVENTORY_PATH=inventory/hosts.ini,inventory/topologies
 CLEAN="false"
 HELP="false"
 
-# Manager repositories
-readonly TDP_UI_URI=https://github.com/TOSIT-IO/tdp-ui
-readonly TDP_SERVER_URI=https://github.com/TOSIT-IO/tdp-server
-readonly TDP_LIB_URI=https://github.com/TOSIT-IO/tdp-lib
-
 # Required binaries
 readonly PYTHON_BIN=${PYTHON_BIN:-python3}
 readonly NPM_BIN=${NPM_BIN:-npm}
@@ -214,7 +209,7 @@ setup_python_venv() {
   echo "Install python dependencies"
   (
     source "${PYTHON_VENV_PATH}/bin/activate"
-    pip install ansible==8.1 # must be compatible with ansible of tdp-lib
+    pip install ansible==8.1
     pip install jmespath==0.10.0
     pip install "mitogen<0.3,>0.2.9"
     pip install passlib==1.7.4
@@ -314,8 +309,6 @@ EOF
 }
 
 init_tdp_lib() {
-  clean_mode_check "$TDP_VARS_PATH"
-  clean_mode_check "$SQLITE_DB_PATH"
   local args=(init)
   if [[ "$CLEAN" == "true" ]]; then
     echo "Remove '${TDP_VARS_PATH}' and '${SQLITE_DB_PATH}'"
