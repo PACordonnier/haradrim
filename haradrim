@@ -80,10 +80,23 @@ run_step() {
   return 0
 }
 
+get_collections() {
+  local collections=()
+  for namespace_dir in "$TDP_COLLECTIONS_ROOT_PATH"/*/; do
+    if [ -d "$namespace_dir" ]; then
+      for collection_dir in "$namespace_dir"*; do
+        if [ -d "$collection_dir" ]; then
+          collections+=("$collection_dir")
+        fi
+      done
+    fi
+  done
+  echo "${collections[@]}"
+}
+
 # Steps
 
 init_setup_vars() {
-
   if [[ ! -f "$CONFIG_FILE" ]]; then
     echo "$CONFIG_FILE doesn't exists, terminating."
     exit 1
@@ -92,14 +105,14 @@ init_setup_vars() {
   TDP_ROOT_PATH=$(realpath "$TDP_ROOT_PATH")
 
   ANSIBLE_CONFIG_PATH=$TDP_ROOT_PATH/ansible.cfg
+  ANSIBLE_GALAXY_REQUIREMENTS_PATH=$TDP_ROOT_PATH/requirements.yml
   BINARIES_PATH=$TDP_ROOT_PATH/files
   ENV_PATH=$TDP_ROOT_PATH/.env
   PYTHON_VENV_PATH=$TDP_ROOT_PATH/venv
   SQLITE_DB_PATH=$TDP_ROOT_PATH/sqlite.db
+  PYTHON_REQUIREMENTS_PATH=$TDP_ROOT_PATH/requirements.txt
   TDP_DATABASE_DSN=sqlite:///$SQLITE_DB_PATH
   TDP_COLLECTIONS_ROOT_PATH=$TDP_ROOT_PATH/ansible_collections
-  TDP_LIB_PATH=$TDP_ROOT_PATH/tdp-lib
-  TDP_SERVER_PATH=$TDP_ROOT_PATH/tdp-server
   TDP_UI_PATH=$TDP_ROOT_PATH/tdp-ui
   TDP_VARS_PATH=$TDP_ROOT_PATH/tdp_vars
 
@@ -113,14 +126,14 @@ Provided arguments:
 
 Variables:
   ANSIBLE_CONFIG_PATH = $ANSIBLE_CONFIG_PATH
+  ANSIBLE_GALAXY_REQUIREMENTS_PATH = $ANSIBLE_GALAXY_REQUIREMENTS_PATH
   BINARIES_PATH = $BINARIES_PATH
   ENV_PATH = $ENV_PATH
   PYTHON_VENV_PATH = $PYTHON_VENV_PATH
   SQLITE_DB_PATH = $SQLITE_DB_PATH
+  PYTHON_REQUIREMENTS_PATH = $PYTHON_REQUIREMENTS_PATH
   TDP_DATABASE_DSN = $TDP_DATABASE_DSN
   TDP_COLLECTIONS_ROOT_PATH = $TDP_COLLECTIONS_ROOT_PATH
-  TDP_LIB_PATH = $TDP_LIB_PATH
-  TDP_SERVER_PATH = $TDP_SERVER_PATH
   TDP_UI_PATH = $TDP_UI_PATH
   TDP_VARS_PATH = $TDP_VARS_PATH
 
@@ -151,13 +164,6 @@ setup_binaries() {
 }
 
 setup_env_vars() {
-  # get collection paths
-  local collection_path=()
-  for namespace in $(jq -r '.collections[].namespace' $CONFIG_FILE); do
-    collection_path+=("$TDP_COLLECTIONS_ROOT_PATH/${namespace//.//}")
-  done
-  collection_path=$(join_arr : "${collection_path[@]}")
-
   clean_mode_check $ENV_PATH
   if [[ $? == 1 ]]; then
     return 0
@@ -169,7 +175,7 @@ setup_env_vars() {
   echo 'Create' $ENV_PATH
   cat <<EOF >"$ENV_PATH"
 # common
-export TDP_COLLECTION_PATH=$collection_path
+export TDP_COLLECTION_PATH="$(join_arr : $(get_collections))"
 export TDP_RUN_DIRECTORY="$TDP_ROOT_PATH"
 export TDP_VARS="$TDP_VARS_PATH"
 
@@ -190,6 +196,23 @@ EOF
   return 0
 }
 
+init_python_requirements() {
+  clean_mode_check "$PYTHON_REQUIREMENTS_PATH"
+  if [[ $? == 1 ]]; then
+    return 0
+  fi
+
+  echo "Create" $PYTHON_REQUIREMENTS_PATH
+  cat <<EOF >"$PYTHON_REQUIREMENTS_PATH"
+ansible==8.1 # must be compatible with ansible of tdp-lib
+jmespath==0.10.0
+mitogen<0.3,>0.2.9
+passlib==1.7.4
+tdp-lib @ git+$(jq -r ".manager.lib.url" $CONFIG_FILE)@$(jq -r ".manager.lib.tag" $CONFIG_FILE)
+tdp-server @ git+$(jq -r ".manager.server.url" $CONFIG_FILE)@$(jq -r ".manager.server.tag" $CONFIG_FILE)
+EOF
+}
+
 setup_python_venv() {
   clean_mode_check "$PYTHON_VENV_PATH"
   if [[ $? == 1 ]]; then
@@ -206,33 +229,46 @@ setup_python_venv() {
   else
     echo "Python venv '${PYTHON_VENV_PATH}' already exists, nothing to do"
   fi
+
   echo "Install python dependencies"
   (
     source "${PYTHON_VENV_PATH}/bin/activate"
-    pip install ansible==8.1
-    pip install jmespath==0.10.0
-    pip install "mitogen<0.3,>0.2.9"
-    pip install passlib==1.7.4
-    pip install "$TDP_ROOT_PATH/tdp-server" uvicorn==0.16.0
-    pip install "$TDP_ROOT_PATH/tdp-lib[visualization]"
+    pip install -r "$PYTHON_REQUIREMENTS_PATH"
   )
   return 0
 }
 
-setup_collections() {
-  clean_mode_check "$TDP_COLLECTIONS_ROOT_PATH"
+init_ansible_galaxy() {
+  clean_mode_check "$ANSIBLE_GALAXY_REQUIREMENTS_PATH"
   if [[ $? == 1 ]]; then
     return 0
   fi
 
-  source "${PYTHON_VENV_PATH}/bin/activate"
+  echo "Create" $ANSIBLE_GALAXY_REQUIREMENTS_PATH
+
+  # Common
+  cat <<EOF >"$ANSIBLE_GALAXY_REQUIREMENTS_PATH"
+collections:
+EOF
+
+  # Collections
   for k in $(jq -r '.collections | keys | .[]' $CONFIG_FILE); do
     collection=$(jq -r ".collections[$k]" $CONFIG_FILE)
-    name=$(jq -r '.name' <<<$collection)
-    tag=$(jq -r '.tag' <<<$collection)
-    echo "Installing " "git+$name,$tag"
-    ansible-galaxy collection install git+$name,$tag -p "$TDP_ROOT_PATH"
+    cat <<EOF >>"$ANSIBLE_GALAXY_REQUIREMENTS_PATH"
+  - name: $(jq -r '.name' <<<$collection)
+    type: $(jq -r '.type' <<<$collection)
+    version: $(jq -r '.version' <<<$collection)
+EOF
   done
+  return 0
+}
+
+install_collections() {
+  clean_mode_check "$TDP_COLLECTIONS_ROOT_PATH"
+  if [[ $? == 1 ]]; then
+    return 0
+  fi
+  ansible-galaxy collection install -r "$ANSIBLE_GALAXY_REQUIREMENTS_PATH" -p "$TDP_ROOT_PATH"
   return 0
 }
 
@@ -254,29 +290,9 @@ setup_symlinks() {
     ln -s "$target" "$link_name"
   }
 
-  for namespace in $(jq -r '.collections[].namespace' $CONFIG_FILE); do
-    create_symlink_if_needed "$BINARIES_PATH" "$TDP_COLLECTIONS_ROOT_PATH/${namespace//.//}/playbooks/files"
+  for collection in $(get_collections); do
+    create_symlink_if_needed "$BINARIES_PATH" "$collection/playbooks/files"
   done
-  return 0
-}
-
-setup_manager() {
-  clone_git_repo() {
-    local url=$(jq -r ".manager.$1.url" $CONFIG_FILE)
-    local tag=$(jq -r ".manager.$1.tag" $CONFIG_FILE)
-    local path=$2
-
-    clean_mode_check $path
-    if [[ $? == 1 ]]; then
-      return 0
-    fi
-    echo "Clonning" $url "tag" $tag
-    git clone --quiet --depth 1 --branch $tag $url $path
-  }
-
-  clone_git_repo lib "$TDP_LIB_PATH"
-  clone_git_repo server "$TDP_SERVER_PATH"
-  clone_git_repo ui "$TDP_UI_PATH"
   return 0
 }
 
@@ -329,9 +345,23 @@ init_tdp_server() {
   (
     source "$PYTHON_VENV_PATH/bin/activate"
     source "$TDP_ROOT_PATH/.env"
-    python "$TDP_SERVER_PATH/tdp_server/initialize_database.py"
-    python "$TDP_SERVER_PATH/tdp_server/initialize_tdp_vars.py"
+    python "$PYTHON_VENV_PATH/lib/python3.9/site-packages/tdp_server/initialize_database.py"
+    python "$PYTHON_VENV_PATH/lib/python3.9/site-packages/tdp_server/initialize_tdp_vars.py"
   )
+  return 0
+}
+
+setup_tdp_ui() {
+  clean_mode_check "$TDP_UI_PATH"
+  if [[ $? == 1 ]]; then
+    return 0
+  fi
+
+  local url=$(jq -r ".manager.ui.url" $CONFIG_FILE)
+  local tag=$(jq -r ".manager.ui.tag" $CONFIG_FILE)
+
+  echo "Clonning" $url "tag" $tag
+  git clone --quiet --depth 1 --branch $tag $url "$TDP_UI_PATH"
   return 0
 }
 
@@ -370,14 +400,16 @@ main() {
 
   run_step init_setup_vars "Initializing setup variables"
   run_step setup_binaries "Download binaries files"
-  run_step setup_manager "Clone TDP manager repositories"
-  run_step setup_env_vars "Initializing environment variables"
-  run_step setup_python_venv "Install Python virtual environment"
-  run_step setup_collections "Installing collections"
+  run_step init_python_requirements "Initializing Python requirements"
+  run_step setup_python_venv "Installing Python virtual environment"
+  run_step init_ansible_galaxy "Initializing Ansible Galaxy requirements"
+  run_step install_collections "Installing collections"
   run_step setup_symlinks "Create symlinks"
+  run_step setup_env_vars "Initializing environment variables"
   run_step init_ansible "Initializing Ansible configuration"
   run_step init_tdp_lib "Initializing tdp-lib"
   run_step init_tdp_server "Initializing tdp-server"
+  run_step setup_tdp_ui "Installing tdp-ui"
   run_step init_tdp_ui "Initializing tdp-ui"
 
   echo -e "\n## Setup complete!"
