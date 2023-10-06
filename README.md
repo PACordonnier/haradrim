@@ -73,5 +73,5 @@ npm --prefix ./tdp-ui run dev
 
 ## Authors
 
-- Paul-Adrian Cordonnier
+- Paul-Adrien Cordonnier
 - Sergei Kudinov
